@@ -10,7 +10,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.decomposition import NMF
+from sklearn.decomposition import NMF, PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.inspection import permutation_importance
 
@@ -20,76 +20,148 @@ import pydeck as pdk
 
 
 st.set_page_config(
-    page_title="Financial Inclusion Tracker",
+    page_title="Financial Inclusion Tracker – UPI Adoption",
     layout="wide",
 )
 
 
+# ---------------------- DATA LOADING & PREP ---------------------- #
 @st.cache_data
-def load_file(uploaded_file):
-    if uploaded_file.name.lower().endswith(".csv"):
-        return pd.read_csv(uploaded_file)
+def load_workbook(uploaded_file):
+    """Load CSV / Excel. Always return a dict of {sheet_name: dataframe}."""
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+        return {"Main": df}
     else:
-        return pd.read_excel(uploaded_file)
+        xls = pd.ExcelFile(uploaded_file)
+        sheets = {}
+        for sheet in xls.sheet_names:
+            sheets[sheet] = xls.parse(sheet)
+        return sheets
 
 
-def detect_default_target(df):
-    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    for col in numeric_cols:
-        name = col.lower()
-        if "adoption" in name or "score" in name or "index" in name:
-            return col
-    return numeric_cols[0] if numeric_cols else None
+def combine_sheets_ui(sheets_dict):
+    """
+    Merge all sheets using a common key (if exists).
+    This is where we use all 6 factor sheets together.
+    """
+    sheet_names = list(sheets_dict.keys())
+    st.sidebar.write("Sheets found: " + ", ".join(sheet_names))
 
+    dfs = [sheets_dict[name] for name in sheet_names]
 
-def overview_page(df):
-    st.subheader("Dataset Overview")
+    # Find common columns across all sheets to use as join key (e.g., District)
+    common_keys = set(dfs[0].columns)
+    for d in dfs[1:]:
+        common_keys &= set(d.columns)
 
-    st.write(f"**Rows:** {df.shape[0]:,}  |  **Columns:** {df.shape[1]:,}")
-    st.dataframe(df.head())
-
-    with st.expander("Column information"):
-        info_df = pd.DataFrame(
-            {
-                "column": df.columns,
-                "dtype": df.dtypes.astype(str).values,
-                "non_nulls": df.notnull().sum().values,
-                "nulls": df.isnull().sum().values,
-            }
+    if not common_keys or len(sheet_names) == 1:
+        st.sidebar.info(
+            "No common column across all sheets (or only one sheet). "
+            "Using the first sheet as the combined dataset."
         )
-        st.dataframe(info_df)
-
-    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    if numeric_cols:
-        with st.expander("Summary statistics (numeric columns)"):
-            st.dataframe(df[numeric_cols].describe().T)
-
-        with st.expander("Quick distribution view"):
-            col = st.selectbox("Choose a numeric column", numeric_cols, key="overview_dist")
-            fig = px.histogram(df, x=col, nbins=30)
-            st.plotly_chart(fig, use_container_width=True)
+        combined = dfs[0].copy()
+        join_key = None
     else:
-        st.info("No numeric columns detected for summary statistics.")
+        common_keys = sorted(list(common_keys))
+        join_key = st.sidebar.selectbox(
+            "Join sheets using key column (common across all sheets)",
+            common_keys,
+        )
+        combined = dfs[0].copy()
+        for name in sheet_names[1:]:
+            combined = combined.merge(
+                sheets_dict[name],
+                on=join_key,
+                how="outer",
+                suffixes=("", f"_{name}"),
+            )
+
+    return combined, join_key
 
 
-def ml_page(df):
-    st.subheader("ML Model – Predict Adoption Score Across Districts")
+def build_adoption_score(df):
+    """
+    Construct an artificial UPI Adoption Score using all numeric factors.
+    This uses PCA on standardized numeric columns and scales to 0–100.
+    """
+    num_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if not num_cols:
+        return df, None
 
-    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    if not numeric_cols:
-        st.warning("No numeric columns available. ML model cannot be built.")
+    num_data = df[num_cols].copy()
+    num_data = num_data.fillna(num_data.median())
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(num_data)
+
+    pca = PCA(n_components=1, random_state=42)
+    component = pca.fit_transform(X_scaled).ravel()
+
+    if component.max() == component.min():
+        score = np.full_like(component, 50.0, dtype=float)
+    else:
+        score = (component - component.min()) / (component.max() - component.min()) * 100
+
+    df_with_score = df.copy()
+    df_with_score["Adoption_Score"] = score
+
+    return df_with_score, num_cols
+
+
+# ---------------------- PAGES ---------------------- #
+def overview_page(sheets_dict, combined_df, join_key):
+    st.subheader("Dataset Overview – All UPI Adoption Factors")
+
+    tabs = st.tabs(["Combined Dataset"] + list(sheets_dict.keys()))
+
+    # Combined view
+    with tabs[0]:
+        st.markdown("**Combined dataset (all factor sheets merged)**")
+        if join_key:
+            st.write(f"Joined using key column: `{join_key}`")
+        else:
+            st.write("No common join key – first sheet used as combined dataset.")
+        st.write(f"Rows: {combined_df.shape[0]:,}  |  Columns: {combined_df.shape[1]:,}")
+        st.dataframe(combined_df.head())
+
+        with st.expander("Combined dataset column information"):
+            info_df = pd.DataFrame(
+                {
+                    "column": combined_df.columns,
+                    "dtype": combined_df.dtypes.astype(str).values,
+                    "non_nulls": combined_df.notnull().sum().values,
+                    "nulls": combined_df.isnull().sum().values,
+                }
+            )
+            st.dataframe(info_df)
+
+    # Individual sheets
+    for i, (sheet_name, df) in enumerate(sheets_dict.items(), start=1):
+        with tabs[i]:
+            st.markdown(f"**Sheet: {sheet_name}**")
+            st.write(f"Rows: {df.shape[0]:,}  |  Columns: {df.shape[1]:,}")
+            st.dataframe(df.head())
+
+
+def ml_page(combined_df):
+    st.subheader("ML Model – UPI Adoption Score Prediction (across districts)")
+
+    if "Adoption_Score" not in combined_df.columns:
+        st.warning("Adoption_Score column missing. Please re-upload your dataset.")
         return
 
-    default_target = detect_default_target(df)
-    target_col = st.selectbox(
-        "Select target column (Adoption score / Inclusion index)",
-        numeric_cols,
-        index=numeric_cols.index(default_target) if default_target in numeric_cols else 0,
+    target_col = "Adoption_Score"
+
+    candidate_features = [c for c in combined_df.columns if c != target_col]
+    st.write(
+        "The app has created an **Adoption_Score** (0–100) using all numeric factors "
+        "from your six sheets via PCA. We now build an ML model to predict this score."
     )
 
-    candidate_features = [c for c in df.columns if c != target_col]
     feature_cols = st.multiselect(
-        "Select feature columns for prediction",
+        "Select feature columns (factors) to use in the prediction model",
         candidate_features,
         default=candidate_features,
     )
@@ -98,7 +170,7 @@ def ml_page(df):
         st.warning("Please select at least one feature column.")
         return
 
-    data = df[feature_cols + [target_col]].dropna()
+    data = combined_df[feature_cols + [target_col]].dropna()
     if data.empty:
         st.warning("No rows remaining after dropping missing values. Please check your data.")
         return
@@ -144,7 +216,7 @@ def ml_page(df):
         X, y, test_size=test_size, random_state=42
     )
 
-    if st.button("Train model"):
+    if st.button("Train adoption score model"):
         pipe.fit(X_train, y_train)
         preds = pipe.predict(X_test)
 
@@ -161,8 +233,7 @@ def ml_page(df):
                 st.success("🎯 Model meets the 0.97+ R² target.")
             else:
                 st.info(
-                    "R² is below 0.97. You may experiment with different features, "
-                    "data cleaning or feature engineering to improve performance."
+                    "R² is below 0.97. Try adding/removing factors or improving data quality."
                 )
 
         with right:
@@ -170,7 +241,7 @@ def ml_page(df):
                 {"Actual": y_test.values, "Predicted": preds}, index=y_test.index
             )
             fig = px.scatter(comp_df, x="Actual", y="Predicted", trendline="ols")
-            fig.update_layout(title="Actual vs Predicted – Adoption Score")
+            fig.update_layout(title="Actual vs Predicted – UPI Adoption Score")
             st.plotly_chart(fig, use_container_width=True)
 
         with st.expander("Feature importance (permutation)"):
@@ -186,13 +257,16 @@ def ml_page(df):
                         "Importance": result["importances_mean"],
                     }
                 ).sort_values("Importance", ascending=False)
-                st.dataframe(importances.head(20).reset_index(drop=True))
+                st.dataframe(importances.head(25).reset_index(drop=True))
             except Exception as e:
                 st.warning(f"Could not compute feature importance: {e}")
 
 
-def time_series_page(df):
+def time_series_page(combined_df):
     st.subheader("Time Series – Forecast Digital Transaction Volume")
+
+    # Work on combined dataset (which already merges all factors)
+    df = combined_df
 
     date_cols = [
         c
@@ -207,12 +281,12 @@ def time_series_page(df):
 
     if not date_cols:
         st.warning(
-            "No obvious date-like columns detected. "
-            "Please ensure your dataset has a date column (e.g., transaction_date)."
+            "No obvious date-like columns detected in the combined dataset. "
+            "Please ensure at least one sheet has a proper date column."
         )
         return
     if not num_cols:
-        st.warning("No numeric transaction volume column found.")
+        st.warning("No numeric column found to forecast.")
         return
 
     date_col = st.selectbox("Select date column", date_cols)
@@ -226,7 +300,7 @@ def time_series_page(df):
     ts = ts.sort_values(date_col)
 
     if ts.empty:
-        st.warning("No valid time series data after cleaning. Please check your date and volume columns.")
+        st.warning("No valid time series data after cleaning. Please check your date & volume columns.")
         return
 
     ts["time_idx"] = np.arange(len(ts))
@@ -246,9 +320,7 @@ def time_series_page(df):
         inferred_freq = "M"
 
     last_date = ts[date_col].iloc[-1]
-    future_dates = pd.date_range(
-        start=last_date, periods=horizon + 1, freq=inferred_freq
-    )[1:]
+    future_dates = pd.date_range(start=last_date, periods=horizon + 1, freq=inferred_freq)[1:]
     last_idx = ts["time_idx"].iloc[-1]
     future_idx = np.arange(last_idx + 1, last_idx + horizon + 1)
     future_preds = model.predict(future_idx.reshape(-1, 1))
@@ -263,10 +335,10 @@ def time_series_page(df):
     history_df = ts[[date_col, target_col]].copy()
     history_df["type"] = "Actual"
 
-    combined = pd.concat([history_df, future_df], ignore_index=True)
+    combined_ts = pd.concat([history_df, future_df], ignore_index=True)
 
     fig = px.line(
-        combined,
+        combined_ts,
         x=date_col,
         y=target_col,
         color="type",
@@ -278,15 +350,21 @@ def time_series_page(df):
     st.dataframe(future_df.head())
 
 
-def text_analytics_page(df):
-    st.subheader("Text Analytics – Themes & Sentiment")
+def text_analytics_page(sheets_dict, combined_df):
+    st.subheader("Text Analytics – Media / Policy Reports")
+
+    # Choose which dataset to use (some sheets may be pure text)
+    options = ["Combined"] + list(sheets_dict.keys())
+    choice = st.selectbox("Select data source for text analytics", options)
+
+    df = combined_df if choice == "Combined" else sheets_dict[choice]
 
     text_cols = df.select_dtypes(include=["object"]).columns.tolist()
     if not text_cols:
-        st.warning("No text (object) columns detected for text analytics.")
+        st.warning("No text (object) columns detected in the selected sheet.")
         return
 
-    text_col = st.selectbox("Select text column (e.g., media reports)", text_cols)
+    text_col = st.selectbox("Select text column", text_cols)
     n_topics = st.slider("Number of topics to extract", 2, 8, 3)
 
     texts = df[text_col].dropna().astype(str)
@@ -316,17 +394,34 @@ def text_analytics_page(df):
         st.dataframe(sent_df.head())
 
 
-def geo_dashboard_page(df):
-    st.subheader("Geo Dashboard – Inclusion Index by Location")
+def geo_dashboard_page(combined_df):
+    st.subheader("Geo Dashboard – UPI Inclusion / Adoption Index by Location")
+
+    df = combined_df
 
     lat_candidates = [c for c in df.columns if "lat" in c.lower()]
     lon_candidates = [c for c in df.columns if "lon" in c.lower() or "lng" in c.lower()]
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
 
-    latitude_col = st.selectbox("Latitude column", df.columns, index=0 if lat_candidates == [] else df.columns.get_loc(lat_candidates[0]))
-    longitude_col = st.selectbox("Longitude column", df.columns, index=0 if lon_candidates == [] else df.columns.get_loc(lon_candidates[0]))
-    value_col = st.selectbox("Inclusion / adoption metric column", num_cols)
+    if not num_cols:
+        st.warning("No numeric columns available for inclusion/adoption value.")
+        return
 
+    latitude_col = st.selectbox(
+        "Latitude column",
+        df.columns,
+        index=df.columns.get_loc(lat_candidates[0]) if lat_candidates else 0,
+    )
+    longitude_col = st.selectbox(
+        "Longitude column",
+        df.columns,
+        index=df.columns.get_loc(lon_candidates[0]) if lon_candidates else 0,
+    )
+    value_col = st.selectbox(
+        "Inclusion / adoption metric column (e.g., Adoption_Score)",
+        num_cols,
+        index=num_cols.index("Adoption_Score") if "Adoption_Score" in num_cols else 0,
+    )
     label_col = st.selectbox(
         "Label column for tooltip (optional)", ["(none)"] + list(df.columns), index=0
     )
@@ -381,47 +476,54 @@ def geo_dashboard_page(df):
     st.dataframe(geo_df[[latitude_col, longitude_col, value_col]].head())
 
 
+# ---------------------- MAIN ---------------------- #
 def main():
-    st.title("Financial Inclusion Tracker – Analytics Prototype")
+    st.title("Financial Inclusion Tracker – UPI Adoption Prototype")
 
-    st.sidebar.header("1. Upload dataset")
+    st.sidebar.header("1. Upload multi-sheet dataset")
     uploaded_file = st.sidebar.file_uploader(
-        "Upload your Capstone dataset (CSV or Excel)", type=["csv", "xlsx"]
+        "Upload your Capstone workbook (Excel/CSV with 6 factor sheets)",
+        type=["csv", "xlsx"],
     )
 
     if uploaded_file is not None:
-        df = load_file(uploaded_file)
-        st.sidebar.success("Dataset loaded successfully.")
-        st.session_state["df"] = df
-    else:
-        if "df" not in st.session_state:
-            st.info("Please upload your dataset to begin.")
-            return
+        sheets_dict = load_workbook(uploaded_file)
+        st.session_state["sheets_dict"] = sheets_dict
+    elif "sheets_dict" not in st.session_state:
+        st.info("Please upload your multi-sheet dataset to begin.")
+        return
 
-    df = st.session_state["df"]
+    sheets_dict = st.session_state["sheets_dict"]
 
-    st.sidebar.header("2. Navigate")
+    st.sidebar.header("2. Combine sheets & build adoption score")
+    combined_df, join_key = combine_sheets_ui(sheets_dict)
+    combined_df, _ = build_adoption_score(combined_df)
+    st.session_state["combined_df"] = combined_df
+
+    st.sidebar.header("3. Navigate")
     page = st.sidebar.radio(
         "Select page",
         (
             "Overview",
             "ML – Adoption Score Prediction",
             "Time Series – Digital Transactions",
-            "Text Analytics – Media Reports",
+            "Text Analytics",
             "Geo Dashboard – Inclusion Index",
         ),
     )
 
+    combined_df = st.session_state["combined_df"]
+
     if page == "Overview":
-        overview_page(df)
+        overview_page(sheets_dict, combined_df, join_key)
     elif page == "ML – Adoption Score Prediction":
-        ml_page(df)
+        ml_page(combined_df)
     elif page == "Time Series – Digital Transactions":
-        time_series_page(df)
-    elif page == "Text Analytics – Media Reports":
-        text_analytics_page(df)
+        time_series_page(combined_df)
+    elif page == "Text Analytics":
+        text_analytics_page(sheets_dict, combined_df)
     elif page == "Geo Dashboard – Inclusion Index":
-        geo_dashboard_page(df)
+        geo_dashboard_page(combined_df)
 
 
 if __name__ == "__main__":
