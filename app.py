@@ -241,42 +241,91 @@ def page_ml(df):
 def page_ts(df):
     st.subheader("Time Series Forecasting – Digital Transaction Volume")
 
-    # Detect safe date column
-    date_cols = [c for c in df.columns if c.lower() in ["ts_date","date","transaction_date","order_date"]]
-    nums = df.select_dtypes(include=np.number).columns.tolist()
+    # Detect possible date formats safely
+    date_cols = [c for c in df.columns if "date" in c.lower()]
+    year_cols = [c for c in df.columns if "year" in c.lower()]
+    month_cols = [c for c in df.columns if "month" in c.lower()]
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
 
-    if not nums:
-        st.error("❌ No numeric columns found for forecasting!")
+    if not numeric_cols:
+        st.error("❌ No numeric column found for forecasting!")
         return
 
-    vol_col = st.selectbox("Select transaction volume column", nums)
+    # Select Digital Transaction Volume Column
+    default_volume = "UPI_Transaction_Volume" if "UPI_Transaction_Volume" in numeric_cols else numeric_cols[0]
+    vol_col = st.selectbox("Select transaction volume column", numeric_cols,
+                           index=numeric_cols.index(default_volume) if default_volume in numeric_cols else 0)
+
+    ts = None
+    date_col = None
 
     if date_cols:
-        date_col = st.selectbox("Select valid date column", date_cols)
+        date_col = st.selectbox("Select date column", date_cols)
         ts = df[[date_col, vol_col]].copy()
         ts[date_col] = pd.to_datetime(ts[date_col], errors="coerce")
+
+    elif year_cols and month_cols:
+        y = st.selectbox("Select Year", year_cols)
+        m = st.selectbox("Select Month", month_cols)
+        ts = df[[y, m, vol_col]].copy()
+
+        for c in [y,m,vol_col]:
+            ts[c] = pd.to_numeric(ts[c], errors="coerce")
+
+        ts = ts.dropna(subset=[y,m,vol_col])
+
+        if ts.empty:
+            st.error("❌ No valid Year/Month rows left!")
+            return
+
+        # Safe manual datetime assembly (avoid duplicate keys)
+        ts["ts_date"] = pd.to_datetime(
+            ts[y].astype(int).astype(str)+"-"+ts[m].astype(int).astype(str)+"-01",
+            errors="coerce"
+        )
+        date_col = "ts_date"
+
     else:
-        st.error("❌ No valid date column detected for time series!")
+        st.error("❌ No valid date structure found for time series!")
         return
 
-    ts = ts.dropna(subset=[date_col,vol_col]).sort_values(date_col)
+    # Final cleaning and sorting
+    ts = ts.dropna(subset=[date_col, vol_col]).sort_values(date_col)
+
     if ts.empty:
-        st.error("❌ No valid date rows remain after conversion!")
+        st.error("❌ No valid rows after date conversion.")
         return
 
+    # Build time index
     ts["t"] = np.arange(len(ts))
-    model = RandomForestRegressor(350, random_state=42, n_jobs=-1).fit(ts[["t"]], ts[vol_col].values)
+    model = RandomForestRegressor(n_estimators=350, random_state=42, n_jobs=-1)
+    model.fit(ts[["t"]], ts[vol_col].values)
+
+    # Forecast horizon
     h = st.slider("Forecast months", 3, 36, 12)
-    future_dates = pd.date_range(start=ts[date_col].iloc[-1], periods=h+1, freq="M")[1:]
-    future_t = np.arange(ts["t"].iloc[-1]+1, ts["t"].iloc[-1]+1+h)
+    last_date = ts[date_col].iloc[-1]
+    future_dates = pd.date_range(start=last_date, periods=h+1, freq="M")[1:]
+    future_t = np.arange(ts["t"].iloc[-1] + 1, ts["t"].iloc[-1] + 1 + h)
     fut_preds = model.predict(future_t.reshape(-1,1))
 
-    fut_df = pd.DataFrame({date_col:future_dates,vol:fut_preds,"Type":"Forecast"})
-    hist_df = ts[[date_col,vol]].copy(); hist_df["Type"]="Actual"
+    # ✅ FIX HERE – use vol_col instead of vol
+    fut_df = pd.DataFrame({
+        date_col: future_dates,
+        vol_col: fut_preds,
+        "Type": "Forecast"
+    })
 
-    st.plotly_chart(px.line(pd.concat([hist_df,fut_df],ignore_index=True),
-                            x=date_col,y=vol,color="Type",title="Actual vs Forecast"),
-                            use_container_width=True)
+    hist_df = ts[[date_col, vol_col]].copy()
+    hist_df["Type"] = "Actual"
+    hist_df.rename(columns={date_col: date_col, vol_col: vol_col}, inplace=True)
+
+    # Plot
+    fig = px.line(pd.concat([hist_df, fut_df], ignore_index=True),
+                  x=date_col, y=vol_col, color="Type",
+                  title="Actual vs Forecast: Digital Transaction Volume")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write("### Forecast Preview")
     st.dataframe(fut_df.head())
 
 
@@ -384,4 +433,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
