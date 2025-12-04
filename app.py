@@ -7,7 +7,6 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA, NMF
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-
 from textblob import TextBlob
 import plotly.express as px
 
@@ -34,8 +33,8 @@ def load_sheets(file):
 
 def merge_all_sheets_columnwise(sheets: dict) -> pd.DataFrame:
     """
-    Simply merge ALL sheets column-wise (outer join on index).
-    No dropping or cleaning – every column from all sheets is kept.
+    Merge ALL sheets column-wise (outer join on index) and keep all columns.
+    If column names clash, suffix with sheet name.
     """
     combined = None
     for name, df in sheets.items():
@@ -60,7 +59,7 @@ def merge_all_sheets_columnwise(sheets: dict) -> pd.DataFrame:
 
             combined = pd.concat([combined, df], axis=1)
 
-    # Keep only first occurrence of exact duplicate column names (if any remain)
+    # Drop truly duplicated column labels if any slipped through
     combined = combined.loc[:, ~combined.columns.duplicated(keep="first")]
     return combined
 
@@ -72,9 +71,12 @@ def merge_all_sheets_columnwise(sheets: dict) -> pd.DataFrame:
 def build_upi_adoption_score(df: pd.DataFrame) -> pd.DataFrame:
     """
     Create UPI_Adoption_Score from all numeric columns using PCA.
-    Text columns (like Report_Text) are untouched and kept.
+    Does NOT touch text columns (e.g. Report_Text).
     """
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+    # Exclude existing score if re-running
+    num_cols = [c for c in num_cols if c != "UPI_Adoption_Score"]
 
     if not num_cols:
         df["UPI_Adoption_Score"] = 50.0
@@ -83,7 +85,6 @@ def build_upi_adoption_score(df: pd.DataFrame) -> pd.DataFrame:
     X = df[num_cols].copy()
     X = X.fillna(X.median())
 
-    # PCA 1 component
     pca = PCA(n_components=1, random_state=42)
     comp = pca.fit_transform(X).ravel()
 
@@ -118,54 +119,60 @@ def page_overview(df: pd.DataFrame):
 def page_ml(df: pd.DataFrame):
     st.subheader("ML Model – Predict Synthetic UPI Adoption Score")
 
-    target = "UPI_Adoption_SScore"
+    target = "UPI_Adoption_Score"
     if target not in df.columns:
-        st.error("❌ UPI_Adoption_SScore column missing. Re-upload data.")
+        st.error("❌ UPI_Adoption_Score not found – score creation failed.")
         return
 
-    # Use numeric features only to avoid encoder issues
+    # Use ONLY numeric features for ML to avoid encoder/type issues
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     if target in num_cols:
         num_cols.remove(target)
 
     if not num_cols:
-        st.error("❌ No numeric feature columns found for ML training.")
+        st.error("❌ No numeric feature columns available for ML.")
         return
 
-    X = df[num_cols].fillna(df[num_cols].median())
+    X = df[num_cols].copy()
+    X = X.fillna(X.median())
     y = df[target]
 
+    # Drop rows where y is NaN (shouldn't happen, but safe)
     mask = y.notna()
     X = X[mask]
     y = y[mask]
 
     test_size = st.sidebar.slider("Test split (%)", 10, 40, 20) / 100
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=42
+    )
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+    model = RandomForestRegressor(
+        n_estimators=500, random_state=42, n_jobs=-1
+    )
 
-    model = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
-
-    if st.button("Train Model"):
+    if st.button("Train ML Model"):
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
 
         r2 = r2_score(y_test, preds)
         mae = mean_absolute_error(y_test, preds)
-        rmse = mean_squared_error(y_test, preds, squared=False)**0.5 if False else mean_squared_error(y_test, preds)**0.5
+        mse = mean_squared_error(y_test, preds)
+        rmse = np.sqrt(mse)
 
-        st.metric("R²", f"{r2:.4f}")
-        st.metric("MAE", f"{mae:.4f}")
-        st.metric("RMSE", f"{rmse:.4f}")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("R²", f"{r2:.4f}")
+        col2.metric("MAE", f"{mae:.3f}")
+        col3.metric("RMSE", f"{rmse:.3f}")
 
         comp_df = pd.DataFrame({"Actual": y_test.values, "Predicted": preds})
         fig = px.scatter(
             comp_df,
             x="Actual",
             y="Predicted",
-            title="Actual vs Predicted Adoption Score"
+            title="Actual vs Predicted – UPI Adoption Score"
         )
         st.plotly_chart(fig, use_container_width=True)
-
 
 
 def page_time_series(df: pd.DataFrame):
@@ -239,9 +246,13 @@ def page_time_series(df: pd.DataFrame):
     hist_df = ts[[date_col, vol_col]].copy()
     hist_df["Type"] = "Actual"
 
-    fig = px.line(pd.concat([hist_df, fut_df], ignore_index=True),
-                  x=date_col, y=vol_col, color="Type",
-                  title="Actual vs Forecast – Transaction Volume")
+    fig = px.line(
+        pd.concat([hist_df, fut_df], ignore_index=True),
+        x=date_col,
+        y=vol_col,
+        color="Type",
+        title="Actual vs Forecast – Transaction Volume"
+    )
     st.plotly_chart(fig, use_container_width=True)
     st.dataframe(fut_df.head())
 
@@ -318,7 +329,7 @@ def page_geo(df: pd.DataFrame):
 
 def main():
     st.sidebar.header("Upload Dataset")
-    file = st.sidebar.file_uploader("Upload Excel/CSV (with 7 sheets including text sheet)", ["csv", "xlsx"])
+    file = st.sidebar.file_uploader("Upload Excel/CSV (your 7-sheet capstone file)", ["csv", "xlsx"])
 
     if file:
         sheets = load_sheets(file)
@@ -351,4 +362,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
