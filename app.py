@@ -118,55 +118,54 @@ def page_overview(df: pd.DataFrame):
 def page_ml(df: pd.DataFrame):
     st.subheader("ML Model – Predict Synthetic UPI Adoption Score")
 
-    target = "UPI_Adoption_Score"
+    target = "UPI_Adoption_SScore"
     if target not in df.columns:
-        st.error("UPI_Adoption_Score not found – something went wrong in score creation.")
+        st.error("❌ UPI_Adoption_SScore column missing. Re-upload data.")
         return
 
-    # Use ONLY numeric features for ML → avoids encoder/type problems
+    # Use numeric features only to avoid encoder issues
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     if target in num_cols:
         num_cols.remove(target)
 
     if not num_cols:
-        st.error("No numeric feature columns available for ML.")
+        st.error("❌ No numeric feature columns found for ML training.")
         return
 
-    X = df[num_cols].copy()
-    X = X.fillna(X.median())
+    X = df[num_cols].fillna(df[num_cols].median())
     y = df[target]
 
-    # Drop rows where y is NaN (shouldn't happen, but safe)
     mask = y.notna()
     X = X[mask]
     y = y[mask]
 
     test_size = st.sidebar.slider("Test split (%)", 10, 40, 20) / 100
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=42
-    )
 
-    model = RandomForestRegressor(
-        n_estimators=500, random_state=42, n_jobs=-1
-    )
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
 
-    if st.button("Train ML Model"):
+    model = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+
+    if st.button("Train Model"):
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
 
         r2 = r2_score(y_test, preds)
         mae = mean_absolute_error(y_test, preds)
-        rmse = mean_squared_error(y_test, preds) ** 0.5
+        rmse = mean_squared_error(y_test, preds, squared=False)**0.5 if False else mean_squared_error(y_test, preds)**0.5
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("R²", f"{r2:.4f}")
-        col2.metric("MAE", f"{mae:.3f}")
-        col3.metric("RMSE", f"{rmse:.3f}")
+        st.metric("R²", f"{r2:.4f}")
+        st.metric("MAE", f"{mae:.4f}")
+        st.metric("RMSE", f"{rmse:.4f}")
 
-        comp_df = pd.DataFrame({"Actual": y_test, "Predicted": preds})
-        fig = px.scatter(comp_df, x="Actual", y="Predicted", trendline="ols",
-                         title="Actual vs Predicted – UPI Adoption Score")
+        comp_df = pd.DataFrame({"Actual": y_test.values, "Predicted": preds})
+        fig = px.scatter(
+            comp_df,
+            x="Actual",
+            y="Predicted",
+            title="Actual vs Predicted Adoption Score"
+        )
         st.plotly_chart(fig, use_container_width=True)
+
 
 
 def page_time_series(df: pd.DataFrame):
@@ -352,3 +351,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
