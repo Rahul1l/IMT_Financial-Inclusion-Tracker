@@ -155,33 +155,50 @@ def page_overview(df):
 # --------------------------------------------------
 
 def page_ml(df):
-    st.subheader("Machine Learning – Predict Adoption Score from 6 Factor Sheets")
+    st.subheader("Machine Learning – Adoption Score Prediction")
 
     target = "UPI_Adoption_SScore"
-
     if target not in df.columns:
-        st.error("❌ Adoption score column missing.")
+        st.error("❌ Target score column missing.")
         return
 
-    X = df.drop(columns=[target], errors="ignore")
+    # Drop target safely
+    X = df.drop(columns=[target], errors="ignore").copy()
     y = df[target]
 
+    # Remove mixed-type object columns and normalize datetime in text
+    for col in X.columns:
+        if X[col].dtype == "object":
+            # Convert datetime objects to string
+            if X[col].apply(lambda x: isinstance(x, (pd.Timestamp, np.datetime64))).any():
+                X[col] = X[col].astype(str)
+
+    # Select clean numeric and categorical columns
     num_cols = X.select_dtypes(include=np.number).columns.tolist()
     cat_cols = X.select_dtypes(include="object").columns.tolist()
 
+    # Ensure categorical columns are now uniform
+    for col in cat_cols:
+        try:
+            X[col] = X[col].astype(str)
+        except:
+            X.drop(columns=[col], inplace=True)
+
+    # Preprocessing
     transformer = make_column_transformer(
         (SimpleImputer(strategy="median"), num_cols),
-        (make_pipeline(SimpleImputer(strategy="most_frequent"),
-                       OneHotEncoder(handle_unknown="ignore")), cat_cols),
+        (make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), cat_cols),
         remainder="drop"
     )
 
-    model = RandomForestRegressor(n_estimators=600, random_state=42, n_jobs=-1)
+    model = RandomForestRegressor(n_estimators=700, random_state=42, n_jobs=-1)
     pipe = make_pipeline(transformer, model)
 
-    split = st.sidebar.slider("Test split (%)", 10, 40, 20) / 100
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=split, random_state=42)
+    # Train-test split
+    test_split = st.sidebar.slider("Test split (%)", 10, 40, 20) / 100
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_split, random_state=42)
 
+    # Train model on safe input
     if st.button("Train ML Model"):
         try:
             pipe.fit(X_tr, y_tr)
@@ -189,32 +206,32 @@ def page_ml(df):
             st.error(f"❌ Training failed: {e}")
             return
 
+        # Predict & evaluate
         pr = pipe.predict(X_te)
-
-        # metrics
         r2 = r2_score(y_te, pr)
         mae = mean_absolute_error(y_te, pr)
         rmse = mean_squared_error(y_te, pr)**0.5
 
-        st.metric("R² Accuracy", f"{r2*100:.2f}%")
+        st.metric("R² Accuracy", f"{r2 * 100:.2f}%")
         st.metric("MAE", round(mae, 4))
         st.metric("RMSE", round(rmse, 4))
 
-        # scatter
-        st.plotly_chart(px.scatter(pd.DataFrame({"Actual":y_te, "Predicted":pr}),
-                                   x="Actual",y="Predicted",trendline="ols"),
-                                   use_container_width=True)
+        # Plot
+        fig = px.scatter(pd.DataFrame({"Actual": y_te, "Predicted": pr}),
+                         x="Actual", y="Predicted", trendline="ols",
+                         title="Actual vs Predicted Adoption Score")
+        st.plotly_chart(fig, use_container_width=True)
 
-        # state-wise prediction if exists
+        # State-wise prediction
         if "State" in df.columns:
-            state_pred = df.groupby("State", as_index=False)["UPI_Adoption_SScore"].mean()
-            X_full = df.drop(columns=[target])
-            pred_full = pipe.predict(X_full)
-            st.write("### Adoption Score Prediction by State")
-            state_pred["Predicted_Score"] = state_pred.apply(
-                lambda row: np.mean(pred_full[df["State"]==row["State"]]), axis=1
-            )
-            st.dataframe(state_pred.head())
+            st.write("### State-wise Adoption Score Prediction")
+            geo = df.groupby("State", as_index=False)["UPI_Adoption_SScore"].mean()
+            X_full = X.copy()
+            try:
+                geo["Predicted_Score"] = pipe.predict(X_full)
+            except:
+                geo["Predicted_Score"] = np.nan
+            st.dataframe(geo)
 
 
 # --------------------------------------------------
@@ -367,3 +384,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
