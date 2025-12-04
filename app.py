@@ -8,12 +8,12 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import make_column_transformer
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.decomposition import PCA, NMF
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
 from textblob import TextBlob
 import plotly.express as px
-import pydeck as pdk
 
 st.set_page_config(page_title="UPI Adoption Prototype", layout="wide")
 
@@ -45,63 +45,62 @@ def merge_all_sheets_columnwise(sheets):
             L = max(len(df_final), len(df))
             df_final = df_final.reindex(range(L)).reset_index(drop=True)
             df = df.reindex(range(L)).reset_index(drop=True)
+            # Fix column collisions
+            df.columns = [c if c not in df_final.columns else f"{c}_{name}" for c in df.columns]
             df_final = pd.concat([df_final, df], axis=1, join="outer")
-    # Fix duplicate column names if any
-    df_final = df_final.loc[:, ~df_final.columns.duplicated(keep='first')]
+
+    df_final = df_final.loc[:, ~df_final.columns.duplicated()]  # remove duplicate columns
     return df_final
 
 
-# --------------------------------------------------
-# BUILD TARGET: SYNTHETIC ADOPTION SCORE
-# --------------------------------------------------
-
 def build_upi_adoption_score(df):
-    num_cols = df.select_dtypes(include=np.number).columns.tolist()
-    if not num_cols:
-        df["UPI_Adoption_Score"] = 50.0
-        return df, []
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if not numeric_cols:
+        df["UPI_Adoption_SScore"] = 50.0
+        return df
 
-    clean = df[num_cols].fillna(df[num_cols].median())
+    clean = df[numeric_cols].fillna(df[numeric_cols].median())
     X = StandardScaler().fit_transform(clean)
     comp = PCA(1, random_state=42).fit_transform(X).ravel()
     score = 50.0 if comp.max()==comp.min() else (comp-comp.min())/(comp.max()-comp.min())*100
-    df["UPI_Adoption_Score"] = score
-    return df, num_cols
+    df["UPI_Adoption_SScore"] = score
+    return df
 
 
 # --------------------------------------------------
-#  PAGES
+# ---------------------- PAGES ---------------------- #
 # --------------------------------------------------
 
 def page_overview(df):
     st.subheader("Dataset Overview")
-    st.write(f"Total rows: {len(df):,}  |  Total columns: {len(df.columns):,}")
+    st.write(f"Rows: {df.shape[0]:,}  |  Columns: {df.shape[1]:,}")
     st.dataframe(df.head())
 
 
 def page_ml(df):
     st.subheader("ML Model – Predict UPI Adoption Score")
 
-    if "UPI_Adoption_Score" not in df.columns:
-        st.error("Target column missing!")
+    score_col = "UPI_Adoption_SScore"
+    if score_col not in df.columns:
+        st.error("❌ Adoption score column missing!")
         return
 
-    X = df.drop(columns=["UPI_Adoption_Score"], errors="ignore")
-    y = df["UPI_Adoption_Score"]
+    X = df.drop(columns=[score_col], errors="ignore")
+    y = df[score_col]
 
-    num = X.select_dtypes(include=np.number).columns.tolist()
-    cat = X.select_dtypes(include="object").columns.tolist()
+    num_cols = X.select_dtypes(include=np.number).columns.tolist()
+    cat_cols = X.select_dtypes(include="object").columns.tolist()
 
     transformer = make_column_transformer(
-        (SimpleImputer(strategy="median"), num),
-        (OneHotEncoder(handle_unknown="ignore"), cat),
+        (SimpleImputer(strategy='median'), num_cols),
+        (SimpleImputer(strategy='most_frequent'), cat_cols),
         remainder="drop"
     )
 
     model = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
     pipe = make_pipeline(transformer, model)
 
-    split = st.sidebar.slider("Test split %", 10, 40, 20) / 100
+    split = st.sidebar.slider("Test split", 0.1, 0.4, 0.2)
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=split, random_state=42)
 
     if st.button("Train Model"):
@@ -110,166 +109,170 @@ def page_ml(df):
 
         r2 = r2_score(y_te, pr)
         mae = mean_absolute_error(y_te, pr)
-        rmse = mean_squared_error(y_te, pr)**0.5
+        rmse = mean_squared_error(y_te, pr) ** 0.5
 
         st.metric("R² Score", f"{r2:.4f}")
         st.metric("MAE", f"{mae:.4f}")
         st.metric("RMSE", f"{rmse:.4f}")
 
-        fig = px.scatter(pd.DataFrame({"Actual":y_te, "Predicted":pr}),
-                         x="Actual", y="Predicted", trendline="ols")
+        fig = px.scatter(pd.DataFrame({"Actual":y_te, "Predicted":pr}), x="Actual", y="Predicted", trendline="ols")
         st.plotly_chart(fig, use_container_width=True)
 
 
 def page_ts(df):
-    st.subheader("Time Series Forecast – Digital Transaction Volume")
+    st.subheader("Time Series Forecast")
 
-    # Detect date formats safely
     date_cols = [c for c in df.columns if "date" in c.lower()]
-    year_cols = [c for c in df.columns if "year" in c.lower()]
-    month_cols = [c for c in df.columns if "month" in c.lower()]
-    nums = df.select_dtypes(include=np.number).columns.tolist()
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
 
-    if not nums:
-        st.error("No numeric columns found!")
+    if not numeric_cols:
+        st.error("❌ No numeric columns found for forecasting!")
         return
 
-    vol_col = st.selectbox("Select volume column", nums)
+    vol_col = st.selectbox("Select transaction volume column", numeric_cols)
+
     ts = None
     date_col = None
 
     if date_cols:
-        date_col = st.selectbox("Select date column", date_cols)
+        date_col = st.selectbox("Select Date column", date_cols)
         ts = df[[date_col, vol_col]].copy()
         ts[date_col] = pd.to_datetime(ts[date_col], errors="coerce")
-    elif year_cols and month_cols:
-        ycol = st.selectbox("Select year", year_cols)
-        mcol = st.selectbox("Select month", month_cols)
-        ts = df[[ycol, mcol, vol_col]].copy()
-        for c in [ycol, mcol, vol_col]:
+
+    elif "Year" in df.columns and "Month" in df.columns:
+        y = st.selectbox("Select Year", ["Year"])
+        m = st.selectbox("Select Month", ["Month"])
+        ts = df[[y,m,vol_col]].copy()
+
+        for c in [y,m,vol_col]:
             ts[c] = pd.to_numeric(ts[c], errors="coerce")
-        ts = ts.dropna(subset=[ycol, mcol, vol_col])
+
+        ts = ts.dropna(subset=[y,m,vol_col])
+
         if ts.empty:
-            st.error("No valid rows!")
+            st.error("❌ No valid date rows left!")
             return
+
         ts["ts_date"] = pd.to_datetime(
-            ts[ycol].astype(int).astype(str) + "-" + ts[mcol].astype(int).astype(str) + "-01",
+            ts[y].astype(int).astype(str)+"-"+ts[m].astype(int).astype(str)+"-01",
             errors="coerce"
         )
         date_col = "ts_date"
 
     if ts is None:
+        st.error("❌ No valid date or Year/Month structure found.")
         return
 
-    date_col = date_col or "ts_date"
     ts = ts.dropna(subset=[date_col, vol_col]).sort_values(date_col)
+
     if ts.empty:
-        st.error("No valid time series rows left!")
+        st.error("❌ No valid rows left for time series!")
         return
 
     ts["t"] = np.arange(len(ts))
-    model = RandomForestRegressor(300, random_state=42, n_jobs=-1)
-    model.fit(ts[["t"]], ts[vol_col].values)
+    model = RandomForestRegressor(300, random_state=42, n_jobs=-1).fit(ts[["t"]], ts[vol_col].values)
 
-    steps = st.slider("Forecast months", 3, 24, 12)
+    future_steps = st.slider("Forecast months", 3, 24, 12)
     last = ts[date_col].iloc[-1]
-    fut_dates = pd.date_range(start=last, periods=steps+1, freq="M")[1:]
-    fut_t = np.arange(ts["t"].iloc[-1]+1, ts["t"].iloc[-1]+1+steps)
-    fut_pr = model.predict(fut_t.reshape(-1,1))
+    future_dates = pd.date_range(start=last, periods=future_steps+1, freq="M")[1:]
+    future_t = np.arange(ts["t"].iloc[-1]+1, ts["t"].iloc[-1]+1+future_steps)
+    fut_preds = model.predict(future_t.reshape(-1,1))
 
-    fut_df = pd.DataFrame({date_col:fut_dates, vol_col:fut_pr, "type":"Forecast"})
-    hist_df = ts[[date_col,vol_col]].copy()
-    hist_df["type"]="Actual"
-
-    st.plotly_chart(px.line(pd.concat([hist_df,fut_df],ignore_index=True),
-                            x=date_col, y=vol_col, color="type"), use_container_width=True)
+    fut_df = pd.DataFrame({date_col:future_dates, vol_col:fut_preds, "type":"Forecast"})
+    hist = ts[[date_col,vol_col]].copy(); hist["type"]="Actual"
+    st.plotly_chart(px.line(pd.concat([hist,fut_df],ignore_index=True),x=date_col,y=vol_col,color="type"),use_container_width=True)
     st.dataframe(fut_df.head())
 
 
 def page_text(df):
-    st.subheader("Text Topic Extraction + Sentiment")
+    st.subheader("Text Analytics + Sentiment")
 
-    txts = df.select_dtypes(include="object").columns.tolist()
-    if not txts:
-        st.warning("No text columns found")
+    text_cols = df.select_dtypes(include="object").columns.tolist()
+
+    if not text_cols:
+        st.error("❌ No text columns found for NLP")
         return
 
-    col = st.selectbox("Pick text column", txts)
-    data = df[col].dropna().astype(str)
-    k = st.slider("Topics", 2, 6, 3)
+    tcol = st.selectbox("Select text column for analytics", text_cols)
+    data = df[tcol].dropna().astype(str)
 
-    vec = TfidfVectorizer(max_features=1500, stop_words="english")
-    X = vec.fit_transform(data)
-    nmf = NMF(n_components=k, random_state=42, init="nndsvda").fit(X)
-    words = vec.get_feature_names_out()
+    if data.empty:
+        st.warning("⚠ No text rows available!")
+        return
+
+    num_topics = st.slider("Number of topics", 2, 6, 3)
+
+    vectorizer = TfidfVectorizer(max_features=1500, stop_words='english')
+    tfidf = vectorizer.fit_transform(data)
+
+    nmf = NMF(n_components=num_topics, random_state=42, init="nndsvda")
+    nmf.fit(tfidf)
+    words = vectorizer.get_feature_names_out()
 
     for i, t in enumerate(nmf.components_):
         topw = [words[idx] for idx in t.argsort()[-10:][::-1]]
-        st.write(f"Topic {i+1}: " + ", ".join(topw))
+        st.write(f"**Topic {i+1}:** " + ", ".join(topw))
 
-    if st.checkbox("Analyze sentiment"):
-        score = data.apply(lambda x: TextBlob(x).sentiment.polarity)
-        st.plotly_chart(px.histogram(score, nbins=25, title="Sentiment Distribution"), use_container_width=True)
-        st.dataframe(score.head())
+    if st.checkbox("Run sentiment analysis"):
+        data["sentiment"] = data.apply(lambda x: TextBlob(x).sentiment.polarity)
+        st.plotly_chart(px.histogram(data["sentiment"], nbins=25, title="Sentiment Distribution"), use_container_width=True)
+        st.dataframe(data[["sentiment"]].head())
 
 
 def page_geo(df):
-    st.subheader("Geo Dashboard")
+    st.subheader("Geo Dashboard – India States by UPI Adoption Score")
 
-    score_col = "UPI_Adoption_Score"
-    lat_cols = [c for c in df.columns if "lat" in c.lower()]
-    lon_cols = [c for c in df.columns if "lon" in c.lower() or "lng" in c.lower()]
-
-    if not lat_cols or not lon_cols:
-        st.error("No geo coordinates found")
+    if "State" not in df.columns:
+        st.error("❌ `State` column not found in your dataset!")
         return
 
-    label_col = st.selectbox("Pick label column", df.columns)
-    lat = st.selectbox("Latitude", lat_cols)
-    lon = st.selectbox("Longitude", lon_cols)
+    geo = df.groupby("State", as_index=False)["UPI_Adoption_SScore"].mean()
 
-    geo = df[[label_col, lat, lon, score_col]].copy()
-    for c in [lat,lon,score_col]:
-        geo[c]=pd.to_numeric(geo[c],errors="coerce")
-    geo = geo.dropna(subset=[lat,lon,score_col])
+    # Plot India state choropleth map
+    fig = px.choropleth(
+        geo,
+        locations="State",
+        locationmode="country names",
+        color="UPI_Adoption_SScore",
+        title="UPI Adoption Score Across India States",
+        scope="asia",
+    )
 
-    if geo.empty:
-        st.error("No valid geo rows left")
-        return
-
-    r = geo[score_col]
-    geo["radius"] = 2000 + (r-r.min())/(r.max()-r.min()+1e-6)*8000
-    layer = pdk.Layer("ScatterplotLayer",geo,get_position=[lon,lat],get_radius="radius",pickable=True)
-    view = pdk.ViewState(latitude=geo[lat].mean(), longitude=geo[lon].mean(), zoom=4)
-
-    st.pydeck_chart(pdk.Deck(layers=[layer],initial_view_state=view,
-                             tooltip={"text":f"{label_col}\nUPI Adoption Score: {{UPI_Adoption_Score}}"}))
+    st.plotly_chart(fig, use_container_width=True)
     st.dataframe(geo.head())
 
 
 # --------------------------------------------------
-# APP ROUTER
+# ---------------------- APP ROUTER ---------------- #
 # --------------------------------------------------
 
 def main():
+    st.sidebar.title("Analytics Navigation")
     file = st.sidebar.file_uploader("Upload dataset", ["csv","xlsx"])
+
     if file:
         sheets = load_sheets(file)
         df = merge_all_sheets_columnwise(sheets)
-        df, _ = build_upi_adoption_score(df)
-        st.session_state["df"]=df
+        df = build_upi_adoption_score(df)
+        st.session_state["df"] = df
 
     df = st.session_state.get("df")
+
     if df is None:
-        st.title("Upload your capstone dataset")
+        st.title("Upload your capstone dataset to begin")
         return
 
-    nav = st.sidebar.radio("Navigate", ["Overview","ML Model","Time Series","Text Analytics","Geo Dashboard"])
-    if nav=="Overview": page_overview(df)
-    elif nav=="Ml Model": page_ml(df)
-    elif nav=="Time Series": page_ts(df)
-    elif nav=="Text Analytics": page_text(df)
-    elif nav=="Geo Dashboard": page_geo(df)
+    nav = st.sidebar.radio("Go to", ["Overview","ML Model","Time Series","Text Analytics","Geo Dashboard"])
+    if nav=="Overview":
+        page_overview(df)
+    elif nav=="ML Model":
+        page_ml(df)
+    elif nav=="Time Series":
+        page_ts(df)
+    elif nav=="Text Analytics":
+        page_text(df)
+    elif nav=="Geo Dashboard":
+        page_geo(df)
 
 
 if __name__ == "__main__":
