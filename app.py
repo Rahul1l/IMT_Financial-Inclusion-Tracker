@@ -1,6 +1,6 @@
 import streamlit as st
-import pandas as p
-import numpy as n
+import pandas as pd
+import numpy as np
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
@@ -13,214 +13,262 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 from textblob import TextBlob
-import plotly.express as x
-import pydeck as d
+import plotly.express as px
+import pydeck as pdk
 
 
 st.set_page_config(layout="wide", page_title="UPI Adoption Tracker")
 
-# ---- Load mult-sheet Excel or CSV ----
+# --------------------------------------------------
+# LOAD & COMBINE ALL SHEETS (COLUMN-WISE)
+# --------------------------------------------------
+
 @st.cache_data
 def load_sheets(file):
     if file.name.lower().endswith(".csv"):
-        df = p.read_csv(file)
+        df = pd.read_csv(file)
         df.columns = df.columns.str.strip().str.title()
         return {"Main": df}
     else:
-        xl = p.ExcelFile(file)
-        sh = {s: xl.parse(s) for s in xl.sheet_names}
-        for k in sh:
-            sh[k].columns = sh[k].columns.str.strip().str.title()
-        return sh
+        xls = pd.ExcelFile(file)
+        sheets = {s: xls.parse(s) for s in xls.sheet_names}
+        for k in sheets:
+            sheets[k].columns = sheets[k].columns.str.strip().str.title()
+        return sheets
 
-# ---- Merge sheets column-wise with outer join on index ----
-def merge_all_sheets(sheets):
-    df = None
-    for name, dff in sheets.items():
-        dff = dff.copy().reset_index(drop=True)
-        if df is None:
-            df = dff
+
+def merge_all_sheets_columnwise(sheets):
+    combined = None
+    for name, df in sheets.items():
+        df = df.copy().reset_index(drop=True)
+        df = df.reindex(range(len(df)))  # ensure index alignment
+        if combined is None:
+            combined = df
         else:
-            L = max(len(df), len(dff))
-            df = df.reindex(range(L))
-            dff = dff.reindex(range(L))
-            # Avoid duplicate column names
-            dff.columns = [c if c not in df.columns else f"{c}_{name}" for c in dff.columns]
-            df = p.concat([df, dff], axis=1)
-    return df
+            max_len = max(len(combined), len(df))
+            combined = combined.reindex(range(max_len))
+            df = df.reindex(range(max_len))
+            # Suffix column names if collision
+            df.columns = [c if c not in combined.columns else f"{c}_{name}" for c in df.columns]
+            combined = pd.concat([combined, df], axis=1)
+    return combined
 
-# ---- Create synthetic UPI Adoption Score via PCA ----
-def compute_upi_score(df):
-    numc = df.select_dtypes(include=n.number).columns.tolist()
-    if not numc:
+
+# --------------------------------------------------
+# COMPUTE SYNTHETIC UPI ADOPTION SCORE USING PCA
+# --------------------------------------------------
+
+def build_upi_adoption_score(df):
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if not numeric_cols:
         df["UPI_Adoption_Score"] = 50.0
         return df
-    X = StandardScaler().fit_transform(df[numc].fillna(df[numc].median()))
-    pc = PCA(1, random_state=42).fit_transform(X).ravel()
-    sc = 50.0 if pc.max()==pc.min() else (pc-pc.min())/(pc.max()-pc.min())*100
-    df["UPI_Adoption_Score"] = sc
+
+    clean = df[numeric_cols].fillna(df[numeric_cols].median())
+    X = StandardScaler().fit_transform(clean)
+    comp = PCA(1, random_state=42).fit_transform(X).ravel()
+    
+    if comp.max() == comp.min():
+        score = 50.0
+    else:
+        score = (comp - comp.min()) / (comp.max() - comp.min()) * 100
+
+    df["UPI_Adoption_Score"] = score
     return df
 
-# ---- Overview Page ----
-def page_overview(df):
-    st.subheader("Combined Dataset Overview")
-    st.write(f"Rows: {df.shape[0]:,}  |  Columns: {df.shape[1]:,}")
-    st.dataframe(df.head())
 
-# ---- ML Model Page ----
+# --------------------------------------------------
+# ML MODEL PAGE
+# --------------------------------------------------
+
 def page_ml(df):
-    st.subheader("ML: Predict UPI Adoption Score")
-    t = "UPI_Adoption_Score"
-    X = df.drop(columns=[t], errors="ignore")
-    y = df[t]
+    if "UPI_Adoption_Score" not in df.columns:
+        st.error("Score column missing! Re-upload dataset.")
+        return
+
+    target = "UPI_Adoption_Score"
+    X = df.drop(columns=[target], errors="ignore")
+    y = df[target]
 
     cat = X.select_dtypes(include="object").columns.tolist()
-    num = X.select_dtypes(include=n.number).columns.tolist()
+    num = X.select_dtypes(include=np.number).columns.tolist()
 
-    tr = ColumnTransformer([
-        ("num", Pipeline([("i",SimpleImputer("median")),("s",StandardScaler())]), num),
-        ("cat", Pipeline([("i",SimpleImputer("most_frequent")),("o",OneHotEncoder(handle_unknown="ignore"))]), cat)
+    transformer = ColumnTransformer([
+        ("num", Pipeline([("i", SimpleImputer("median")), ("s", StandardScaler())]), num),
+        ("cat", Pipeline([("i", SimpleImputer("most_frequent")), ("o", OneHotEncoder(handle_unknown="ignore"))]), cat),
     ], remainder="drop")
 
-    m = RandomForestRegressor(500,random_state=42,n_jobs=-1)
-    pipe = Pipeline([("p", tr), ("m", m)])
+    model = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+    pipe = Pipeline([("p", transformer), ("m", model)])
 
-    sp = st.sidebar.slider("Test split",0.1,0.4,0.2)
-    X_tr, X_te, y_tr, y_te = train_test_split(X,y,test_size=sp,random_state=42)
-    if st.button("Train ML Model"):
-        pipe.fit(X_tr,y_tr)
+    split = st.sidebar.slider("Test split", 0.1, 0.5, 0.2)
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=split, random_state=42)
+
+    if st.button("Train model"):
+        pipe.fit(X_tr, y_tr)
         pr = pipe.predict(X_te)
-        st.metric("R²",f"{r2_score(y_te,pr):.4f}")
-        st.metric("MAE",f"{mean_absolute_error(y_te,pr):.4f}")
-        st.metric("RMSE",f"{mean_squared_error(y_te,pr)**0.5:.4f}")
-        st.plotly_chart(x.scatter(p.DataFrame({"Actual":y_te,"Pred":pr}),x="Actual",y="Pred",trendline="ols"),use_container_width=True)
+        st.metric("R²", f"{r2_score(y_te, pr):.4f}")
+        st.metric("MAE", f"{mean_absolute_error(y_te, pr):.4f}")
+        st.metric("RMSE", f"{mean_squared_error(y_te, pr)**0.5:.4f}")
 
-# ---- Time Series Page ----
+        st.plotly_chart(px.scatter(pd.DataFrame({"Actual":y_te, "Predicted":pr}), x="Actual", y="Predicted", trendline="ols"), use_container_width=True)
+
+
+# --------------------------------------------------
+# TIME SERIES FORECAST PAGE
+# --------------------------------------------------
+
 def page_ts(df):
-    st.subheader("Time Series Forecast")
-    D = [c for c in df.columns if "date" in c.lower()]
-    Y = [c for c in df.columns if "year" in c.lower()]
-    M = [c for c in df.columns if "month" in c.lower()]
-    nums = df.select_dtypes(include=n.number).columns.tolist()
+    date_cols = [c for c in df.columns if "date" in c.lower()]
+    year_cols = [c for c in df.columns if "year" in c.lower()]
+    month_cols = [c for c in df.columns if "month" in c.lower()]
 
-    vol = st.selectbox("Transaction Volume Column", nums)
+    num_cols = df.select_dtypes(include=np.number).columns.tolist()
+    vol = st.selectbox("Transaction Volume Column", num_cols)
 
-    if D:
-        dat = st.selectbox("Date Column", D)
-        ts = df[[dat, vol]].copy()
-        ts[dat] = p.to_datetime(ts[dat], errors="coerce")
-        dc = dat
-    elif Y and M:
-        ycol = st.selectbox("Year Column", Y)
-        mcol = st.selectbox("Month Column", M)
-        ts = df[[ycol, mcol, vol]].copy()
-        for c in [ycol,mcol,vol]:
-            ts[c] = p.to_numeric(ts[c], errors="coerce")
-        ts = ts.dropna(subset=[ycol,mcol,vol])
+    ts = None
+    date_col = None
+
+    if "district" in [c.lower() for c in df.columns]:
+        st.write("⚠ Forecast ignores District column (no common key present)")
+
+    if date_cols:
+        date_col = st.selectbox("Date Column", date_cols)
+        ts = df[[date_col, vol]].copy()
+        ts[date_col] = pd.to_datetime(ts[date_col], errors="coerce")
+        date_col = date_col
+
+    elif year_cols and month_cols:
+        y = st.selectbox("Year", year_cols)
+        m = st.selectbox("Month", month_cols)
+        ts = df[[y, m, vol]].copy()
+        for c in [y, m, vol]:
+            ts[c] = pd.to_numeric(ts[c], errors="coerce")
+        ts = ts.dropna(subset=[y, m, vol])
+
         if ts.empty:
-            st.error("No valid year/month rows")
+            st.error("No valid rows left to form time series")
             return
-        ts["ts_date"] = p.to_datetime(
-            ts[ycol].astype(int).astype(str)+"-"+ts[mcol].astype(int).astype(str)+"-01",
+
+        ts["ts_date"] = pd.to_datetime(
+            ts[y].astype(int).astype(str) + "-" + ts[m].astype(int).astype(str) + "-01",
             errors="coerce"
         )
-        dc = "ts_date"
+        date_col = "ts_date"
+
     else:
-        st.error("No valid date columns")
+        st.error("No valid date structure found")
         return
 
-    ts = ts.dropna(subset=[dc, vol]).sort_values(dc)
-    if ts.empty:
-        st.error("No valid rows after date cleaning")
-        return
+    ts = ts.dropna(subset=[date_col, vol]).sort_values(date_col)
+    ts["t"] = np.arange(len(ts))
+    model = RandomForestRegressor(300, random_state=42, n_jobs=-1).fit(ts[["t"]], ts[vol].values)
 
-    ts["t"] = n.arange(len(ts))
-    model = RandomForestRegressor(300,random_state=42,n_jobs=-1).fit(ts[["t"]], ts[vol].values)
+    h = st.slider("Forecast months", 3, 36, 12)
+    fut_dates = pd.date_range(start=ts[date_col].iloc[-1], periods=h+1, freq="M")[1:]
+    fut_t = np.arange(ts["t"].iloc[-1]+1, ts["t"].iloc[-1]+1+h)
+    fut_pr = model.predict(fut_t.reshape(-1,1))
 
-    h = st.slider("Forecast months",3,36,12)
-    last = ts[dc].iloc[-1]
-    f_date = p.date_range(start=last,periods=h+1,freq="M")[1:]
-    f_t = n.arange(ts["t"].iloc[-1]+1, ts["t"].iloc[-1]+1+h)
-    f_pr = model.predict(f_t.reshape(-1,1))
+    fut_df = pd.DataFrame({date_col:fut_dates,vol:fut_pr,"type":"Forecast"})
+    hist = ts[[date_col,vol]].copy(); hist["type"]="Actual"
+    st.plotly_chart(px.line(pd.concat([hist,fut_df],ignore_index=True),x=date_col,y=vol,color="type"),use_container_width=True)
+    st.dataframe(fut_df.head())
 
-    fdf = p.DataFrame({dc:f_date,vol:f_pr,"type":"Forecast"})
-    hist = ts[[dc,vol]].copy(); hist["type"]="Actual"
-    st.plotly_chart(x.line(p.concat([hist,fdf],ignore_index=True),x=dc,y=vol,color="type"),use_container_width=True)
-    st.dataframe(fdf.head())
 
-# ---- Text Analytics Page ----
+# --------------------------------------------------
+# TEXT ANALYTICS PAGE
+# --------------------------------------------------
+
 def page_text(df):
-    st.subheader("Text Analytics")
     txts = df.select_dtypes(include="object").columns.tolist()
     if not txts:
-        st.warning("No text columns")
+        st.warning("No text columns found")
         return
-    col = st.selectbox("Text Column", txts)
-    dta = df[col].dropna().astype(str)
-    k = st.slider("Topics",2,6,3)
-    v = TfidfVectorizer(max_features=1500,stop_words="english").fit_transform(dta)
-    nmf = NMF(k,random_state=42,init="nndsvda").fit(v)
-    w = TfidfVectorizer().fit(dta).get_feature_names_out()
-    for i,t in enumerate(nmf.components_): 
-        st.write(f"Topic {i+1}: " + ", ".join([w[idx] for idx in t.argsort()[-10:][::-1]]))
-    if st.checkbox("Sentiment"):
-        st.dataframe(dta.apply(lambda x: TextBlob(x).sentiment.polarity).head())
+    col = st.selectbox("Text column", txts)
+    data = df[col].dropna().astype(str)
 
-# ---- Geo Dashboard Page ----
+    k = st.slider("Topics", 2, 6, 3)
+    vec = TfidfVectorizer(max_features=1500, stop_words="english")
+    X = vec.fit_transform(data)
+    nmf = NMF(n_components=k,random_state=42,init="nndsvda").fit(X)
+    words = vec.get_feature_names_out()
+
+    for i, t in enumerate(nmf.components_):
+        topw = [words[idx] for idx in t.argsort()[-10:][::-1]]
+        st.write(f"Topic {i+1}: " + ", ".join(topw))
+
+    if st.checkbox("Sentiment"):
+        score = data.apply(lambda x: TextBlob(x).sentiment.polarity)
+        st.plotly_chart(px.histogram(score, nbins=25, title="Sentiment Distribution"))
+        st.dataframe(score.head())
+
+
+# --------------------------------------------------
+# GEO DASHBOARD PAGE
+# --------------------------------------------------
+
 def page_geo(df):
-    st.subheader("Geo Dashboard")
+    if "UPI_Adoption_SScore" not in df.columns:
+        st.error("No adoption score column available for map!")
+        return
 
     lat_cols = [c for c in df.columns if "lat" in c.lower()]
     lon_cols = [c for c in df.columns if "lon" in c.lower() or "lng" in c.lower()]
 
     if not lat_cols or not lon_cols:
-        st.error("No coordinates for geo")
+        st.error("No latitude/longitude columns found!")
         return
 
-    lab = st.selectbox("District/Label Column", df.columns)
-    lat = st.selectbox("Latitude Column", lat_cols)
-    lon = st.selectbox("Longitude Column", lon_cols)
+    label = st.selectbox("District/Label", df.columns)
+    lat = st.selectbox("Latitude", lat_cols)
+    lon = st.selectbox("Longitude", lon_cols)
 
-    geo = df[[lab, lat, lon, "UPI_Adoption_Score"]].copy()
-    for c in [lat,lon,"UPI_Adoption_Score"]:
-        geo[c] = p.to_numeric(geo[c], errors="coerce")
+    geo_df = df[[label, lat, lon, "UPI_Adoption_SScore"]].copy()
+    for c in [lat, lon, "UPI_Adoption_SScore"]:
+        geo[c] = pd.to_numeric(geo[c], errors="coerce")
 
-    geo = geo.dropna(subset=[lat,lon,"UPI_Adoption_Score"])
-    if geo.empty:
-        st.error("No valid geo rows after numeric cleaning")
+    geo_df = geo_df.dropna()
+    if geo_df.empty:
+        st.error("No valid geo rows left after cleaning")
         return
 
-    r = geo["UPI_Adoption_Score"]
-    geo["radius"] = 2000 + (r - r.min())/(r.max()-r.min()+1e-6)*8000
+    r = geo_df["UPI_Adoption_SScore"]
+    geo_df["radius"] = 2000 + (r - r.min())/(r.max()-r.min()+1e-5)*8000
+    layer = pdk.Layer("ScatterplotLayer", geo_df, get_position=[lon, lat], get_radius="radius", pickable=True)
+    view = pdk.ViewState(latitude=geo_df[lat_col].mean(), longitude=geo_df[lon_col].mean(), zoom=4)
 
-    layer = d.Layer("ScatterplotLayer",geo,get_position=[lon,lat],get_radius="radius",pickable=True)
-    st.pydeck_chart(d.Deck(layers=[layer],initial_view_state=d.ViewState(latitude=geo[lat].mean(),longitude=geo[lon].mean(),zoom=4),tooltip={"text":f"{lab}\nUPI Adoption: {{UPI_Adoption_Score}}"}))
-    st.dataframe(geo.head())
+    st.pydeck_chart(pdk.Deck(layers=[layer],initial_view_state=view,tooltip={"text":"UPI Adoption: {UPI_Adoption_SScore}"}))
+    st.dataframe(geo_df.head())
 
-# ---- Router ----
+
+# --------------------------------------------------
+# FINAL MAIN ROUTER
+# --------------------------------------------------
+
 def main():
-    if "df" not in st.session_state:
-        st.session_state["df"] = None
+    st.title("Financial Inclusion – UPI Adoption Prototype")
 
     file = st.sidebar.file_uploader("Upload dataset", ["csv","xlsx"])
+
     if file:
         sheets = load_sheets(file)
-        df = merge_all_sheets(sheets)
+        df = merge_all_sheets_columnwise(sheets)
         df = build_upi_adoption_score(df)
-        st.session_state["df"] = df
+        st.session_state["df"]=df
 
-    if st.session_state["df"] is None:
-        st.title("Upload your dataset to begin")
+    df = st.session_state.get("df")
+    if df is None:
+        st.title("Upload your capstone dataset")
         return
 
-    df = st.session_state["df"]
-
     nav = st.sidebar.radio("Navigate", ["Overview","ML Model","Time Series","Text Analytics","Geo Dashboard"])
+
     if nav=="Overview": page_overview(df)
     elif nav=="ML Model": page_ml(df)
     elif nav=="Time Series": page_ts(df)
     elif nav=="Text Analytics": page_text(df)
     elif nav=="Geo Dashboard": page_geo(df)
+
 
 if __name__ == "__main__":
     main()
